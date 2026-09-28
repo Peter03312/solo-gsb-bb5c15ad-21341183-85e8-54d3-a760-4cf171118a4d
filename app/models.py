@@ -793,6 +793,93 @@ class CounterRatesResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+class SimplifyRequest(BaseModel):
+    """无状态折线压缩请求（保误差顺序扫描）。"""
+
+    series_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="可选的业务序列标识，随响应回显",
+    )
+    points: list[PointIn] = Field(
+        min_length=2,
+        description="带时间戳的观测点（至少 2 个）；无需预先排序，服务端自动排序并拒绝重复时间戳",
+    )
+    tolerance: FiniteFloat = Field(
+        ge=0,
+        description=(
+            "允许的最大绝对数值误差（≥0 且有限）：省略点相对输出折线回放值的误差"
+            "不得超过该上限；取 0 时仅允许省略精确共线点"
+        ),
+    )
+    max_gap_seconds: FiniteFloat = Field(
+        gt=0,
+        description=(
+            "强制断段的相邻采样间隔（秒，>0 且有限）：相邻采样间隔严格超过该值"
+            "时必须断段，断段两侧的点均保留（等号不算断档）"
+        ),
+    )
+
+
+class SimplifiedPoint(BaseModel):
+    """压缩后保留的单个点。"""
+
+    index: int = Field(description="保留点在输出折线中的序号（从 0 开始，按时间升序）")
+    original_index: int = Field(
+        description="该点在排序后输入序列中的原始索引（从 0 开始）"
+    )
+    timestamp: str
+    value: float
+    segment_index: int = Field(description="该点所属压缩段编号（从 0 开始）")
+
+
+class PolylineSegment(BaseModel):
+    """压缩段：容差首次超限或采样断档都会开启新段。"""
+
+    segment_index: int = Field(description="段编号（从 0 开始）")
+    start_index: int = Field(description="段首保留点在排序后输入序列中的索引")
+    end_index: int = Field(description="段末保留点在排序后输入序列中的索引")
+    start_time: str
+    end_time: str
+    input_point_count: int = Field(description="该段覆盖的原始输入点数（含省略点）")
+    kept_point_count: int = Field(description="该段保留的点数")
+
+
+class SimplifyGapBoundary(BaseModel):
+    """采样断档边界：断档发生在 before/after 两个相邻原始点之间。"""
+
+    before_index: int = Field(description="断档前最后一个点的索引")
+    after_index: int = Field(description="断档后第一个点的索引")
+    before_time: str
+    after_time: str
+    gap_seconds: float = Field(description="断档两侧实际时间差（秒）")
+
+
+class SimplifyResponse(BaseModel):
+    series_id: str | None = None
+    tolerance: float = Field(description="回显误差上限")
+    max_gap_seconds: float = Field(description="回显断段间隔上限（秒）")
+    input_point_count: int = Field(description="压缩前点数（排序去重后的输入点数）")
+    kept_point_count: int = Field(description="压缩后保留点数")
+    segment_count: int = Field(description="压缩段总数")
+    gap_boundary_count: int = Field(description="超过 max_gap_seconds 的采样断档数")
+    max_abs_error: float = Field(
+        description=(
+            "回放输出折线（段内相邻保留点按实际时间线性插值）计算出的"
+            "全部原始点最大绝对误差；保留点自身误差为 0"
+        )
+    )
+    max_error_index: int = Field(description="取得最大绝对误差的原始点索引（并列取最早）")
+    max_error_timestamp: str = Field(description="取得最大绝对误差的原始点时刻")
+    points: list[SimplifiedPoint] = Field(description="按时间升序的保留点（含原始索引与段编号）")
+    segments: list[PolylineSegment] = Field(description="压缩段列表（按时间升序）")
+    gap_boundaries: list[SimplifyGapBoundary] = Field(
+        description="采样断档边界列表（按时间升序）；无断档时为空列表"
+    )
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class CounterReadingsUpsertRequest(BaseModel):
     """计数器读数分批归档请求（按 series_id 合并入库）。
 

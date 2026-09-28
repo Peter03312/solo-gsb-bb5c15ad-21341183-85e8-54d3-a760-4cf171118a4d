@@ -36,11 +36,14 @@ from .models import (
     ResampleResponse,
     SegmentStatusResponse,
     SegmentStatusUpdateRequest,
+    SimplifyRequest,
+    SimplifyResponse,
     TrendRequest,
     TrendResponse,
     parse_timestamp,
 )
 from .resampling import epoch_microseconds, resample_series, whole_microseconds
+from .simplify import simplify_polyline
 from .trends import scan_trends
 
 
@@ -72,8 +75,12 @@ app = FastAPI(
         "计数器归档接口按 series_id 分批接收乱序 / 重叠读数，在 SQLite 事务内按时间戳合并"
         "（同值幂等、异值 409），并沿用首批固定的回卷 / 断档参数对全序列重算区间与 epoch，"
         "查询接口返回最新计算结果与已接收点数。"
+        "折线压缩接口为无状态保误差顺序扫描：以每段首点为锚维护允许斜率区间，"
+        "逐点检查候选端点连线能否使此前所有省略点误差不超过上限，首次超限保留前一点续扫；"
+        "相邻采样间隔超过 max_gap_seconds 强制断段且两侧点均保留，"
+        "误差上限为 0 时共线点仍可省略，并回放输出折线计算最大绝对误差。"
     ),
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -404,6 +411,32 @@ def resample(req: ResampleRequest) -> dict:
     except ValueError as exc:
         # 网格点数超过上限等业务约束 → 422
         raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post("/api/v1/simplify", response_model=SimplifyResponse, tags=["折线压缩"])
+def simplify(req: SimplifyRequest) -> dict:
+    """无状态折线压缩：以每段首点为锚维护允许斜率区间的保误差顺序扫描。
+
+    - 复用统一时间戳解析（ISO-8601 / epoch 秒毫秒）、自动排序与重复时间戳校验；
+    - 以每段首点为锚，逐点检查候选端点连线能否使此前所有省略点的数值误差
+      不超过 ``tolerance``；首次超限时保留前一点作为新锚继续扫描；
+    - 相邻采样间隔严格超过 ``max_gap_seconds`` 时必须断段，断段两侧点均保留；
+    - ``tolerance=0`` 时仅精确共线点可省略；
+    - 响应按原时间顺序返回保留点及其原始索引、分段编号、压缩前后点数，
+      并用输出折线回放（段内线性插值）计算最大绝对误差。
+    """
+    try:
+        timestamps, values = _prepare_series(req.points, label="points ")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return simplify_polyline(
+        timestamps,
+        values,
+        tolerance=req.tolerance,
+        max_gap_seconds=req.max_gap_seconds,
+        series_id=req.series_id,
+    )
 
 
 @app.post(

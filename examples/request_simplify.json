@@ -1,0 +1,19 @@
+{
+  "series_id": "polyline-simplify-demo",
+  "tolerance": 0.6,
+  "max_gap_seconds": 300,
+  "points": [
+    {"timestamp": "2026-09-22T00:00:00Z", "value": 0.0},
+    {"timestamp": "2026-09-22T00:01:00Z", "value": 0.4},
+    {"timestamp": "2026-09-22T00:02:00Z", "value": 2.2},
+    {"timestamp": "2026-09-22T00:03:00Z", "value": 3.1},
+    {"timestamp": "2026-09-22T00:04:00Z", "value": 4.0},
+    {"timestamp": "2026-09-22T00:05:00Z", "value": 5.3},
+    {"timestamp": "2026-09-22T00:06:00Z", "value": 6.0},
+    {"timestamp": "2026-09-22T01:00:00Z", "value": 60.0},
+    {"timestamp": "2026-09-22T01:01:00Z", "value": 60.5},
+    {"timestamp": "2026-09-22T01:02:00Z", "value": 62.0},
+    {"timestamp": "2026-09-22T01:03:00Z", "value": 63.0},
+    {"timestamp": "2026-09-22T01:04:00Z", "value": 64.0}
+  ]
+}

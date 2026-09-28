@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -22,6 +23,7 @@ from app.lag_correlation import (  # noqa: E402
 )
 from app.main import app  # noqa: E402
 from app.resampling import resample_series, whole_microseconds  # noqa: E402
+from app.simplify import simplify_polyline  # noqa: E402
 from app.trends import _mann_kendall, scan_trends  # noqa: E402
 
 
@@ -1052,6 +1054,179 @@ def test_counter_rates_gap_boundary_and_all_unknown() -> None:
     print("✓ 计数器速率：max_gap 等号边界、超限 unknown 切断、全 unknown 汇总 null 正确")
 
 
+def _simplify_ts(n: int, step: int = 60) -> list[str]:
+    return [
+        (datetime(2026, 9, 22, 0, 0, 0, tzinfo=timezone.utc)
+         + timedelta(seconds=step * i)).isoformat()
+        for i in range(n)
+    ]
+
+
+def test_simplify_collinear_zero_tolerance() -> None:
+    """严格直线 + tolerance=0：全部中间点省略，共线点仍可省略，回放误差为 0。"""
+    ts = _simplify_ts(10)
+    values = [5.0 + 2.0 * i for i in range(10)]
+    r = simplify_polyline(ts, values, tolerance=0, max_gap_seconds=300)
+    assert r["input_point_count"] == 10 and r["kept_point_count"] == 2
+    assert [(p["original_index"], p["segment_index"]) for p in r["points"]] == [(0, 0), (9, 0)]
+    assert r["segment_count"] == 1 and r["gap_boundary_count"] == 0
+    assert r["max_abs_error"] == 0.0 and r["max_error_index"] == 0
+    seg = r["segments"][0]
+    assert (seg["start_index"], seg["end_index"]) == (0, 9)
+    assert seg["input_point_count"] == 10 and seg["kept_point_count"] == 2
+    print("✓ 折线压缩：零容差共线直线压为首尾两点、回放零误差")
+
+
+def test_simplify_non_collinear_zero_tolerance_splits() -> None:
+    """零容差下任何偏离直线的点都触发断段；两点序列原样保留。"""
+    ts = _simplify_ts(5)
+    r = simplify_polyline(ts, [10.0, 11.0, 12.5, 13.0, 14.0], tolerance=0, max_gap_seconds=300)
+    # 0->1 可行；i=2 偏 0.5 不可行：保留 1、以 2 为新锚；2->3 可行；
+    # i=4 相对锚 2 不共线：保留 3、以 4 为新锚
+    assert [(p["original_index"], p["segment_index"]) for p in r["points"]] == [
+        (0, 0), (1, 0), (2, 1), (3, 1), (4, 2),
+    ]
+    assert r["segment_count"] == 3 and r["max_abs_error"] == 0.0
+
+    # 非等距但严格共线（斜率一致）：整数微秒交叉积比较仍判共线
+    base = datetime(2026, 9, 22, tzinfo=timezone.utc)
+    ir_ts = [(base + timedelta(seconds=o)).isoformat() for o in (0, 7, 13, 42, 100)]
+    r2 = simplify_polyline(ir_ts, [0.0, 7.0, 13.0, 42.0, 100.0], tolerance=0,
+                           max_gap_seconds=300)
+    assert [p["original_index"] for p in r2["points"]] == [0, 4]
+
+    # 仅两个点：无论容差与间隔结构如何都原样保留
+    r3 = simplify_polyline(ts[:2], [1.0, 9.0], tolerance=0, max_gap_seconds=10)
+    assert [(p["original_index"], p["segment_index"]) for p in r3["points"]] == [
+        (0, 0), (1, 1),
+    ]
+    assert r3["kept_point_count"] == 2 and r3["segment_count"] == 2
+    print("✓ 折线压缩：零容差非共线断段、非等距共线识别、两点序列原样保留")
+
+
+def test_simplify_first_violation_keeps_previous_point() -> None:
+    """正容差：首次超限时保留前一点作新锚继续扫描，回放误差不超过容差。"""
+    ts = _simplify_ts(6)
+    # 锚 0：i=1(斜率1)、i=2(斜率1.5)、i=3(斜率4/3)、i=4(斜率1.25) 均可行
+    # （交集逐点收紧，00:02 回放误差 0.5 恰在容差上）；i=5 斜率 1.2 落在
+    # 下界 4/3 之外 → 首次超限，保留前一点 i=4 为段 0 终点，以 i=5 为新锚
+    r = simplify_polyline(ts, [0.0, 1.0, 3.0, 4.0, 5.0, 6.0],
+                          tolerance=0.5, max_gap_seconds=300)
+    kept = [(p["original_index"], p["segment_index"]) for p in r["points"]]
+    assert kept == [(0, 0), (4, 0), (5, 1)]
+    # 段 0 回放（0 -> 4 直线，斜率 1.25）：00:02 回放 2.5（实际 3），最大误差 0.5
+    assert abs(r["max_abs_error"] - 0.5) < 1e-12
+    assert r["max_error_index"] == 2
+
+    # 构造「候选点自身即超界」的首次超限：00:02=12，0->2 直线在该处即偏离 2，
+    # 任何连线都无法同时容纳 00:01 与 00:02 → 保留前一点 1，以 2 为新锚
+    r2 = simplify_polyline(ts, [0.0, 1.0, 12.0, 13.0, 14.0, 15.0],
+                           tolerance=0.5, max_gap_seconds=600)
+    kept2 = [(p["original_index"], p["segment_index"]) for p in r2["points"]]
+    assert kept2[0] == (0, 0) and kept2[1] == (1, 0)
+    assert kept2[2] == (2, 1)
+    assert r2["max_abs_error"] <= 0.5 + 1e-9
+
+    # 容差放宽：整条折线可由首尾连线表达时压为 2 点
+    r3 = simplify_polyline(ts, [0.0, 1.0, 3.0, 4.0, 5.0, 6.0],
+                           tolerance=1.0, max_gap_seconds=600)
+    assert [p["original_index"] for p in r3["points"]] == [0, 5]
+    # 回放：00:02 的回放值 = 2.4，实际 3，最大误差 0.6 < 容差 1
+    assert abs(r3["max_abs_error"] - 0.6) < 1e-12
+    assert r3["max_error_index"] == 2
+    print("✓ 折线压缩：首次超限保留前一点续扫、容差边界回放误差正确")
+
+
+def test_simplify_gap_forces_break_both_sides_kept() -> None:
+    """相邻采样间隔 > max_gap 强制断段，两侧点均保留；等号不断。"""
+    # 00:00~00:04 与 01:00~01:04 两段每分钟一点：00:04 -> 01:00 间隔 3360s
+    base = datetime(2026, 9, 22, 0, 0, 0, tzinfo=timezone.utc)
+    ts = [(base + timedelta(minutes=i)).isoformat() for i in range(5)]
+    ts += [(base + timedelta(hours=1, minutes=i)).isoformat() for i in range(5)]
+    values = [float(i) for i in range(5)] + [100.0 + i for i in range(5)]
+
+    r = simplify_polyline(ts, values, tolerance=0, max_gap_seconds=300)
+    kept = [(p["original_index"], p["segment_index"]) for p in r["points"]]
+    assert kept == [(0, 0), (4, 0), (5, 1), (9, 1)]
+    assert r["segment_count"] == 2 and r["gap_boundary_count"] == 1
+    gap = r["gap_boundaries"][0]
+    assert (gap["before_index"], gap["after_index"]) == (4, 5)
+    assert gap["gap_seconds"] == 3360.0
+    assert [s["input_point_count"] for s in r["segments"]] == [5, 5]
+    # 不跨段回放：段内为严格直线，最大误差 0
+    assert r["max_abs_error"] == 0.0
+
+    # 阈值恰好等于断档间隔（3360s，含等号）：不断段
+    eq = simplify_polyline(ts, values, tolerance=1e9, max_gap_seconds=3360)
+    assert eq["gap_boundary_count"] == 0 and eq["segment_count"] == 1
+    over = simplify_polyline(ts, values, tolerance=1e9, max_gap_seconds=3359)
+    assert over["gap_boundary_count"] == 1 and over["segment_count"] == 2
+
+    # 连续多个断档：每段两个点全部保留
+    g3_ts = ["2026-09-22T00:00:00+00:00", "2026-09-22T01:00:00+00:00",
+             "2026-09-22T02:00:00+00:00"]
+    g3 = simplify_polyline(g3_ts, [0.0, 10.0, 20.0], tolerance=0, max_gap_seconds=60)
+    assert [p["segment_index"] for p in g3["points"]] == [0, 1, 2]
+    assert len(g3["gap_boundaries"]) == 2
+    print("✓ 折线压缩：断档强制断段两侧保留、等号不断、连续断档逐段编号")
+
+
+def test_simplify_replay_error_invariant_random() -> None:
+    """随机性质测试：回放误差恒 ≤ tolerance；断档两侧保留且不跨段回放。"""
+    import random
+
+    rng = random.Random(20260928)
+    for _ in range(300):
+        n = rng.randint(2, 30)
+        t = 0
+        times: list[int] = []
+        for _ in range(n):
+            times.append(t)
+            t += rng.choice([1, 5, 30, 60, 300, 600, 4000])
+        v = rng.uniform(-50, 50)
+        values = []
+        for _ in range(n):
+            v += rng.uniform(-3, 3)
+            values.append(v)
+        ts = [
+            (datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=x)).isoformat()
+            for x in times
+        ]
+        eps = rng.choice([0.0, 0.1, 1.0, 5.0])
+        mg = rng.choice([1.0, 60.0, 300.0, 5000.0])
+        r = simplify_polyline(ts, values, tolerance=eps, max_gap_seconds=mg)
+
+        # 断档边界与真实 > mg 的相邻间隔一一对应
+        real_gaps = [
+            (i - 1, i) for i in range(1, n) if (times[i] - times[i - 1]) * 1_000_000
+            > round(mg * 1_000_000)
+        ]
+        assert [(g["before_index"], g["after_index"]) for g in r["gap_boundaries"]] == real_gaps
+
+        # 独立回放：按 segment_index 分组，段内相邻保留点线性插值，不跨段
+        by_seg: dict[int, list[int]] = {}
+        seg_of: dict[int, int] = {}
+        for p in r["points"]:
+            by_seg.setdefault(p["segment_index"], []).append(p["original_index"])
+            seg_of[p["original_index"]] = p["segment_index"]
+        for a, b in real_gaps:  # 断档两侧保留且属于不同段
+            assert a in seg_of and b in seg_of and seg_of[a] != seg_of[b]
+
+        worst = 0.0
+        for members in by_seg.values():
+            members.sort()
+            for j in range(len(members) - 1):
+                a, b = members[j], members[j + 1]
+                for q in range(a, b + 1):  # 段内不得跨越断档间隔
+                    assert times[q] - times[a] <= times[b] - times[a]
+                    rec = values[a] + (values[b] - values[a]) * (
+                        (times[q] - times[a]) / (times[b] - times[a])
+                    )
+                    worst = max(worst, abs(values[q] - rec))
+        assert worst <= eps + 1e-9
+    print("✓ 折线压缩：300 组随机序列回放误差不超容差、断档边界与不跨段性质成立")
+
+
 def test_api_end_to_end(tmp_db: str = "/tmp/tsad_smoke.db") -> None:
     import os
 
@@ -1883,9 +2058,124 @@ def _exercise_api(client: "TestClient") -> None:
     )
     assert r.status_code == 422
 
+    # 无状态折线压缩：容差断段 + 采样断档，返回原始索引 / 段编号 / 回放误差
+    simplify_payload = {
+        "series_id": "test-simplify",
+        "tolerance": 0.6,
+        "max_gap_seconds": 300,
+        "points": [
+            {"timestamp": f"2026-09-22T00:{i:02d}:00Z", "value": v}
+            for i, v in enumerate([0.0, 0.4, 2.2, 3.1, 4.0, 5.3, 6.0])
+        ] + [
+            {"timestamp": f"2026-09-22T01:0{i}:00Z", "value": v}
+            for i, v in enumerate([60.0, 60.5, 62.0, 63.0, 64.0])
+        ],
+    }
+    r = client.post("/api/v1/simplify", json=simplify_payload)
+    assert r.status_code == 200, r.text
+    sb = r.json()
+    assert sb["series_id"] == "test-simplify"
+    assert sb["input_point_count"] == 12 and sb["kept_point_count"] == 6
+    assert sb["segment_count"] == 3 and sb["gap_boundary_count"] == 1
+    assert [(p["index"], p["original_index"], p["segment_index"]) for p in sb["points"]] == [
+        (0, 0, 0), (1, 1, 0), (2, 2, 1), (3, 6, 1), (4, 7, 2), (5, 11, 2),
+    ]
+    # 输出顺序即原时间顺序，timestamp/value 与原始序列一致
+    assert sb["points"][3]["timestamp"] == "2026-09-22T00:06:00+00:00"
+    assert sb["points"][3]["value"] == 6.0
+    # 逐段覆盖点数与保留点数
+    assert [(s["segment_index"], s["input_point_count"], s["kept_point_count"])
+            for s in sb["segments"]] == [(0, 2, 2), (1, 5, 2), (2, 5, 2)]
+    # 断档边界
+    gb = sb["gap_boundaries"][0]
+    assert (gb["before_index"], gb["after_index"]) == (6, 7)
+    assert gb["gap_seconds"] == 3240.0
+    # 回放最大误差不超过容差，取得位置为 01:01（回放 60 -> 实际 60.5）
+    assert sb["max_abs_error"] <= 0.6 + 1e-9
+    assert abs(sb["max_abs_error"] - 0.5) < 1e-12
+    assert sb["max_error_index"] == 8
+    assert sb["max_error_timestamp"] == "2026-09-22T01:01:00+00:00"
+
+    # 零容差共线直线：10 点压为首尾 2 点、单段、零回放误差
+    line_payload = {
+        "tolerance": 0,
+        "max_gap_seconds": 300,
+        "points": [
+            {"timestamp": f"2026-09-22T02:{i:02d}:00Z", "value": 3.0 * i}
+            for i in range(10)
+        ],
+    }
+    r = client.post("/api/v1/simplify", json=line_payload)
+    assert r.status_code == 200, r.text
+    lb = r.json()
+    assert lb["kept_point_count"] == 2 and lb["segment_count"] == 1
+    assert [p["original_index"] for p in lb["points"]] == [0, 9]
+    assert lb["max_abs_error"] == 0.0 and lb["gap_boundaries"] == []
+
+    # 乱序提交结果一致（服务端排序；original_index 指向排序后序列）
+    r = client.post(
+        "/api/v1/simplify",
+        json={**simplify_payload, "points": list(reversed(simplify_payload["points"]))},
+    )
+    assert r.status_code == 200
+    rev = r.json()
+    assert [(p["timestamp"], p["original_index"], p["segment_index"]) for p in rev["points"]] == \
+           [(p["timestamp"], p["original_index"], p["segment_index"]) for p in sb["points"]]
+    assert rev["max_abs_error"] == sb["max_abs_error"]
+
+    # max_gap 等号边界：间隔恰好 300s 不断段（线性直线可压）
+    equal_payload = {
+        "tolerance": 0,
+        "max_gap_seconds": 300,
+        "points": [
+            {"timestamp": "2026-09-22T03:00:00Z", "value": 0.0},
+            {"timestamp": "2026-09-22T03:05:00Z", "value": 1.0},
+            {"timestamp": "2026-09-22T03:10:00Z", "value": 2.0},
+        ],
+    }
+    r = client.post("/api/v1/simplify", json=equal_payload)
+    assert r.status_code == 200
+    assert r.json()["gap_boundary_count"] == 0
+    assert [p["original_index"] for p in r.json()["points"]] == [0, 2]
+
+    # 参数校验：不足 2 点 / 重复时间戳 / 负容差 / 非正 max_gap
+    r = client.post("/api/v1/simplify", json={
+        "tolerance": 1, "max_gap_seconds": 60, "points": simplify_payload["points"][:1],
+    })
+    assert r.status_code == 422
+    bad = dict(simplify_payload, points=simplify_payload["points"] + [simplify_payload["points"][0]])
+    r = client.post("/api/v1/simplify", json=bad)
+    assert r.status_code == 422 and "重复时间戳" in r.text
+    for field, value in [("tolerance", -0.1), ("max_gap_seconds", 0), ("max_gap_seconds", -5)]:
+        bad = dict(simplify_payload)
+        bad[field] = value
+        r = client.post("/api/v1/simplify", json=bad)
+        assert r.status_code == 422, (field, r.text)
+
+    # 非有限 tolerance / max_gap / value：手工构造原始请求体
+    for field, value in [("tolerance", float("nan")), ("tolerance", float("inf")),
+                         ("max_gap_seconds", float("nan")), ("max_gap_seconds", float("inf"))]:
+        bad = dict(simplify_payload)
+        bad[field] = value
+        r = client.post(
+            "/api/v1/simplify", content=_json.dumps(bad),
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 422, (field, r.text)
+    r = client.post(
+        "/api/v1/simplify",
+        content=_json.dumps({
+            "tolerance": 1, "max_gap_seconds": 60,
+            "points": [{"timestamp": "2026-09-22T00:00:00Z", "value": 0.0},
+                       {"timestamp": "2026-09-22T00:01:00Z", "value": float("nan")}],
+        }),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422
+
     print(
         "✓ API 端到端测试通过：提交 / 查询 / 列表 / 404 / 参数校验 / guarded 策略 / "
-        "趋势扫描 / 时滞关联 / 事件聚合 / 无状态重采样 / 计数器速率"
+        "趋势扫描 / 时滞关联 / 事件聚合 / 无状态重采样 / 计数器速率 / 折线压缩"
     )
 
 
@@ -2252,6 +2542,11 @@ if __name__ == "__main__":
     test_counter_rates_wrap_tolerance_boundaries()
     test_counter_rates_no_max_counter_and_zero_delta()
     test_counter_rates_gap_boundary_and_all_unknown()
+    test_simplify_collinear_zero_tolerance()
+    test_simplify_non_collinear_zero_tolerance_splits()
+    test_simplify_first_violation_keeps_previous_point()
+    test_simplify_gap_forces_break_both_sides_kept()
+    test_simplify_replay_error_invariant_random()
     test_api_end_to_end()
     test_counter_series_archive_api()
     test_segment_status_workflow()
