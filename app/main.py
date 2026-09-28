@@ -36,11 +36,14 @@ from .models import (
     ResampleResponse,
     SegmentStatusResponse,
     SegmentStatusUpdateRequest,
+    SimplifyRequest,
+    SimplifyResponse,
     TrendRequest,
     TrendResponse,
     parse_timestamp,
 )
 from .resampling import epoch_microseconds, resample_series, whole_microseconds
+from .simplify import simplify_series
 from .trends import scan_trends
 
 
@@ -72,8 +75,12 @@ app = FastAPI(
         "计数器归档接口按 series_id 分批接收乱序 / 重叠读数，在 SQLite 事务内按时间戳合并"
         "（同值幂等、异值 409），并沿用首批固定的回卷 / 断档参数对全序列重算区间与 epoch，"
         "查询接口返回最新计算结果与已接收点数。"
+        "折线压缩接口为无状态摆动门（斜率区间）压缩：以每段首点为锚维护允许斜率区间，"
+        "候选端点连线使此前所有省略点误差不超过上限时即可省略，首次超限保留前一点作新锚；"
+        "相邻采样间隔超过 max_gap_seconds 断段且两侧点均保留，误差上限为 0 时共线点仍可省略，"
+        "返回保留点的原始索引 / 分段编号、压缩前后点数与回放最大绝对误差。"
     ),
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -104,22 +111,32 @@ async def request_validation_exception_handler(
     )
 
 
-def _prepare_series(points: list, label: str = "") -> tuple[list[str], list[float]]:
-    """解析时间戳，按时间排序并检查重复。"""
+def _prepare_series_with_indices(
+    points: list, label: str = ""
+) -> tuple[list[str], list[float], list[int]]:
+    """解析时间戳，按时间排序并检查重复；同时返回各点在请求数组中的原始索引。"""
     parsed = []
-    for p in points:
+    for idx, p in enumerate(points):
         dt = parse_timestamp(p.timestamp)
-        parsed.append((dt, p.value))
+        parsed.append((dt, p.value, idx))
     parsed.sort(key=lambda item: item[0])
 
     timestamps: list[str] = []
     values: list[float] = []
-    for dt, value in parsed:
+    indices: list[int] = []
+    for dt, value, idx in parsed:
         iso = dt.isoformat()
         if timestamps and iso == timestamps[-1]:
             raise HTTPException(status_code=422, detail=f"{label}存在重复时间戳: {iso}")
         timestamps.append(iso)
         values.append(value)
+        indices.append(idx)
+    return timestamps, values, indices
+
+
+def _prepare_series(points: list, label: str = "") -> tuple[list[str], list[float]]:
+    """解析时间戳，按时间排序并检查重复。"""
+    timestamps, values, _ = _prepare_series_with_indices(points, label)
     return timestamps, values
 
 
@@ -435,6 +452,35 @@ def counter_rates(req: CounterRatesRequest) -> dict:
         values,
         max_counter=req.max_counter,
         wrap_tolerance=req.wrap_tolerance,
+        max_gap_seconds=req.max_gap_seconds,
+        series_id=req.series_id,
+    )
+
+
+@app.post("/api/v1/simplify", response_model=SimplifyResponse, tags=["折线压缩"])
+def simplify(req: SimplifyRequest) -> dict:
+    """无状态折线压缩（摆动门 / 斜率区间算法），结果不入库。
+
+    - 以每段首点为锚维护允许斜率区间，逐点检查锚点到候选端点的连线能否让
+      此前所有省略点的数值误差都不超过 ``max_error``；首次超限时保留前一点
+      作新锚继续扫描；
+    - 相邻采样间隔超过 ``max_gap_seconds`` 必须断段，断段两侧的点均保留；
+    - ``max_error=0`` 时只有与锚点共线的点可省略；
+    - 返回保留点（原始索引、分段编号）、压缩前后点数，并用输出折线回放
+      计算最大绝对误差。
+    """
+    try:
+        timestamps, values, original_indices = _prepare_series_with_indices(
+            req.points, label="points "
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return simplify_series(
+        timestamps,
+        values,
+        original_indices,
+        max_error=req.max_error,
         max_gap_seconds=req.max_gap_seconds,
         series_id=req.series_id,
     )

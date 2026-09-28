@@ -865,3 +865,64 @@ class CounterReadingsUpsertResponse(CounterSeriesResponse):
     )
 
     model_config = ConfigDict(extra="ignore")
+
+
+class SimplifyRequest(BaseModel):
+    """无状态折线压缩请求（摆动门 / 斜率区间算法）。"""
+
+    series_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="可选的业务序列标识，随响应回显",
+    )
+    points: list[PointIn] = Field(
+        min_length=2,
+        description=(
+            "带时间戳的观测点（至少 2 个）；无需预先排序，服务端自动排序并拒绝重复时间戳"
+        ),
+    )
+    max_error: FiniteFloat = Field(
+        ge=0,
+        description=(
+            "允许的最大数值误差上限（≥0 且有限）：省略点相对输出折线回放值的绝对误差"
+            "不超过该值；取 0 时仅与锚点严格共线的点可省略"
+        ),
+    )
+    max_gap_seconds: FiniteFloat = Field(
+        gt=0,
+        description=(
+            "允许连续压缩的最大相邻采样间隔（秒，**>0 且有限**）：相邻间隔超过该值"
+            "即断段，断段两侧的点均保留且不跨断档连线；间隔恰好等于阈值不断段"
+        ),
+    )
+
+
+class SimplifiedPoint(BaseModel):
+    """折线压缩后的单个保留点。"""
+
+    index: int = Field(
+        description="保留点在请求 points 数组中的原始索引（从 0 开始）；输入乱序时仍对应提交顺序"
+    )
+    timestamp: str = Field(description="保留点时刻（UTC ISO-8601）")
+    value: float = Field(description="保留点原始观测值（不修改）")
+    segment_index: int = Field(
+        description=(
+            "分段编号（从 0 开始）：相邻采样间隔超过 max_gap_seconds 断段时递增；"
+            "同一连续段内的保留点编号相同，输出折线只连接同段内相邻保留点"
+        )
+    )
+
+
+class SimplifyResponse(BaseModel):
+    series_id: str | None = None
+    max_error: float = Field(description="回显误差上限")
+    max_gap_seconds: float = Field(description="回显断档上限（秒）")
+    input_point_count: int = Field(description="压缩前点数（排序去重后）")
+    output_point_count: int = Field(description="压缩后点数（保留点数）")
+    segment_count: int = Field(description="分段总数（断档数 + 1）")
+    max_abs_error: float = Field(
+        description="用输出折线回放全部原始点得到的最大绝对误差（应 ≤ max_error）"
+    )
+    points: list[SimplifiedPoint] = Field(description="保留点列表，按时间升序")
+
+    model_config = ConfigDict(extra="ignore")

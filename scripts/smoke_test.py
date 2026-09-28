@@ -1052,6 +1052,107 @@ def test_counter_rates_gap_boundary_and_all_unknown() -> None:
     print("✓ 计数器速率：max_gap 等号边界、超限 unknown 切断、全 unknown 汇总 null 正确")
 
 
+def test_simplify_swinging_door() -> None:
+    """摆动门：共线段压缩、尖刺保留、首次超限保留前一点作新锚。"""
+    from app.simplify import simplify_series
+
+    ts = [f"2026-09-22T00:0{i}:00+00:00" for i in range(6)]
+    values = [0.0, 1.0, 2.0, 10.0, 3.0, 4.0]  # 0-1-2 共线，3 尖刺，4-5 回落
+    idx = list(range(6))
+    r = simplify_series(ts, values, idx, max_error=0.5, max_gap_seconds=3600)
+    # 点 1 恰在 0→2 连线上被省略；尖刺 3 及其两侧被迫保留
+    assert [p["index"] for p in r["points"]] == [0, 2, 3, 4, 5]
+    assert r["input_point_count"] == 6 and r["output_point_count"] == 5
+    assert r["segment_count"] == 1
+    assert all(p["segment_index"] == 0 for p in r["points"])
+    assert r["max_abs_error"] == 0.0  # 唯一省略点恰在连线上
+    # 保留点时间戳 / 数值原样返回
+    assert r["points"][1]["timestamp"] == "2026-09-22T00:02:00+00:00"
+    assert r["points"][1]["value"] == 2.0
+    print("✓ 折线压缩：摆动门共线压缩、尖刺保留与首超限换锚正确")
+
+
+def test_simplify_zero_error_collinear() -> None:
+    """误差上限为 0：共线点仍可省略，偏离点触发换锚保留。"""
+    from app.simplify import simplify_series
+
+    ts = [f"2026-09-22T00:00:0{i}+00:00" for i in range(5)]
+    values = [5.0, 7.0, 9.0, 11.0, 12.0]  # 前 4 点共线（斜率 2/秒），末点偏离
+    idx = list(range(5))
+    r = simplify_series(ts, values, idx, max_error=0.0, max_gap_seconds=3600)
+    assert [p["index"] for p in r["points"]] == [0, 3, 4]
+    assert r["max_abs_error"] == 0.0
+
+    # 全部共线时压缩到只剩首尾两点
+    r2 = simplify_series(ts, [5.0, 7.0, 9.0, 11.0, 13.0], idx,
+                         max_error=0.0, max_gap_seconds=3600)
+    assert [p["index"] for p in r2["points"]] == [0, 4]
+    assert r2["output_point_count"] == 2
+    print("✓ 折线压缩：max_error=0 共线省略、偏离点保留正确")
+
+
+def test_simplify_gap_break_keeps_both_sides() -> None:
+    """断档强制断段：两侧点均保留、分段编号递增、不跨断档连线；等号不断段。"""
+    from app.simplify import simplify_series
+
+    ts = [
+        "2026-09-22T00:00:00+00:00", "2026-09-22T00:01:00+00:00",
+        "2026-09-22T00:02:00+00:00", "2026-09-22T01:00:00+00:00",
+        "2026-09-22T01:01:00+00:00", "2026-09-22T01:02:00+00:00",
+    ]
+    values = [0.0, 1.0, 2.0, 10.0, 11.0, 12.0]  # 两段各自共线，中间 58 分钟断档
+    idx = list(range(6))
+    r = simplify_series(ts, values, idx, max_error=0.5, max_gap_seconds=300)
+    # 断档两侧的点（索引 2 与 3）均保留，分段编号 0/1
+    assert [p["index"] for p in r["points"]] == [0, 2, 3, 5]
+    assert [p["segment_index"] for p in r["points"]] == [0, 0, 1, 1]
+    assert r["segment_count"] == 2
+    assert r["max_abs_error"] == 0.0
+
+    # 间隔恰好 == max_gap_seconds 不断段（含等号语义）
+    eq = simplify_series(
+        ["2026-09-22T00:00:00+00:00", "2026-09-22T00:05:00+00:00"],
+        [0.0, 5.0], [0, 1], max_error=0.0, max_gap_seconds=300,
+    )
+    assert eq["segment_count"] == 1
+    assert [p["segment_index"] for p in eq["points"]] == [0, 0]
+
+    # 间隔 301s > 300s 断段：两个点分属不同分段
+    over = simplify_series(
+        ["2026-09-22T00:00:00+00:00", "2026-09-22T00:05:01+00:00"],
+        [0.0, 5.0], [0, 1], max_error=0.0, max_gap_seconds=300,
+    )
+    assert over["segment_count"] == 2
+    assert [p["segment_index"] for p in over["points"]] == [0, 1]
+    print("✓ 折线压缩：断档断段、两侧保留、分段编号与等号边界正确")
+
+
+def test_simplify_replay_error_within_tolerance() -> None:
+    """含噪序列：回放最大绝对误差不超过 max_error，压缩后点数更少。"""
+    from app.simplify import simplify_series
+
+    n = 60
+    ts = []
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 9, 22, 0, 0, 0, tzinfo=timezone.utc)
+    for i in range(n):
+        ts.append((base + timedelta(minutes=i)).isoformat())
+    # 斜坡 0.1/分钟 叠加周期小噪声（幅度 ≤0.2）
+    values = [
+        0.1 * i + (0.2 if i % 7 == 0 else (-0.1 if i % 5 == 0 else 0.0))
+        for i in range(n)
+    ]
+    idx = list(range(n))
+    r = simplify_series(ts, values, idx, max_error=0.5, max_gap_seconds=3600)
+    assert r["output_point_count"] < n
+    assert r["max_abs_error"] <= 0.5 + 1e-9
+    # 回放误差来自被省略点；保留点自身误差为 0
+    kept_idx = {p["index"] for p in r["points"]}
+    assert len(kept_idx) == r["output_point_count"]
+    print("✓ 折线压缩：回放最大绝对误差不超过误差上限、压缩生效")
+
+
 def test_api_end_to_end(tmp_db: str = "/tmp/tsad_smoke.db") -> None:
     import os
 
@@ -1883,9 +1984,124 @@ def _exercise_api(client: "TestClient") -> None:
     )
     assert r.status_code == 422
 
+    # 无状态折线压缩：斜坡 + 噪声点 + 尖刺 + 断档
+    simplify_points = [
+        {"timestamp": f"2026-09-22T00:{i:02d}:00Z", "value": 20.0 + 0.5 * i}
+        for i in range(10)
+    ]
+    simplify_points[3]["value"] = 21.6  # 偏离共线 0.1 的噪声点（< max_error）
+    simplify_points += [{"timestamp": "2026-09-22T00:10:00Z", "value": 40.0}]  # 尖刺
+    simplify_points += [
+        {"timestamp": f"2026-09-22T00:{i:02d}:00Z", "value": 25.0 + 0.5 * (i - 11)}
+        for i in range(11, 16)
+    ]
+    simplify_points += [
+        {"timestamp": f"2026-09-22T03:{i:02d}:00Z", "value": 30.0}
+        for i in range(6)
+    ]
+    simplify_payload = {
+        "series_id": "test-simplify",
+        "max_error": 0.3,
+        "max_gap_seconds": 300,
+        "points": simplify_points,
+    }
+    r = client.post("/api/v1/simplify", json=simplify_payload)
+    assert r.status_code == 200, r.text
+    sb = r.json()
+    assert sb["series_id"] == "test-simplify"
+    assert sb["max_error"] == 0.3 and sb["max_gap_seconds"] == 300.0
+    assert sb["input_point_count"] == 22 and sb["output_point_count"] == 7
+    assert sb["segment_count"] == 2
+    # 保留点：斜坡首尾、尖刺、第二斜坡首尾、断档两侧、末点
+    assert [p["index"] for p in sb["points"]] == [0, 9, 10, 11, 15, 16, 21]
+    assert [p["segment_index"] for p in sb["points"]] == [0, 0, 0, 0, 0, 1, 1]
+    # 回放最大绝对误差来自噪声点（0.1），不超过 max_error
+    assert abs(sb["max_abs_error"] - 0.1) < 1e-9
+    assert sb["max_abs_error"] <= sb["max_error"]
+    # 保留点时间戳 / 数值原样返回，按时间升序
+    assert sb["points"][0]["timestamp"] == "2026-09-22T00:00:00+00:00"
+    assert sb["points"][0]["value"] == 20.0
+    assert [p["timestamp"] for p in sb["points"]] == sorted(
+        p["timestamp"] for p in sb["points"]
+    )
+
+    # 乱序提交：结果按时间重排，原始索引仍对应提交顺序
+    shuffled = list(reversed(simplify_points))
+    r = client.post(
+        "/api/v1/simplify", json={**simplify_payload, "points": shuffled}
+    )
+    assert r.status_code == 200, r.text
+    sh = r.json()
+    assert sh["output_point_count"] == 7 and sh["segment_count"] == 2
+    #  reversed 提交后原索引 i 的点位于 21-i
+    assert [p["index"] for p in sh["points"]] == [21, 12, 11, 10, 6, 5, 0]
+    assert [p["value"] for p in sh["points"]] == [p["value"] for p in sb["points"]]
+
+    # max_error=0：共线点仍可省略（恒定段压缩到首尾）
+    r = client.post(
+        "/api/v1/simplify",
+        json={
+            "max_error": 0,
+            "max_gap_seconds": 300,
+            "points": [
+                {"timestamp": "2026-09-22T00:00:00Z", "value": 7.0},
+                {"timestamp": "2026-09-22T00:01:00Z", "value": 7.0},
+                {"timestamp": "2026-09-22T00:02:00Z", "value": 7.0},
+                {"timestamp": "2026-09-22T00:03:00Z", "value": 8.0},
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    zb = r.json()
+    assert [p["index"] for p in zb["points"]] == [0, 2, 3]
+    assert zb["max_abs_error"] == 0.0
+
+    # 参数校验：点数不足 / 重复时间戳 / max_error 负 / max_gap_seconds 非正
+    r = client.post(
+        "/api/v1/simplify",
+        json={"max_error": 0.3, "max_gap_seconds": 300,
+              "points": [{"timestamp": "2026-09-22T00:00:00Z", "value": 1.0}]},
+    )
+    assert r.status_code == 422
+    bad = dict(simplify_payload)
+    bad["points"] = simplify_points + [simplify_points[0]]
+    r = client.post("/api/v1/simplify", json=bad)
+    assert r.status_code == 422 and "重复时间戳" in r.text
+    for field, value in [
+        ("max_error", -0.1),
+        ("max_gap_seconds", 0),
+        ("max_gap_seconds", -5),
+    ]:
+        bad = dict(simplify_payload)
+        bad[field] = value
+        r = client.post("/api/v1/simplify", json=bad)
+        assert r.status_code == 422, (field, value, r.text)
+    # 非有限参数 / 非法时间戳 / 非有限 value
+    for field, value in [("max_error", float("nan")), ("max_error", float("inf")),
+                         ("max_gap_seconds", float("inf"))]:
+        bad = dict(simplify_payload)
+        bad[field] = value
+        r = client.post(
+            "/api/v1/simplify", content=_json.dumps(bad),
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 422, (field, r.text)
+    bad = dict(simplify_payload)
+    bad["points"] = [{"timestamp": "not-a-time", "value": 1.0},
+                     {"timestamp": "2026-09-22T00:01:00Z", "value": 2.0}]
+    r = client.post("/api/v1/simplify", json=bad)
+    assert r.status_code == 422
+    bad = dict(simplify_payload)
+    bad["points"] = [dict(p, value=float("nan")) for p in simplify_points]
+    r = client.post(
+        "/api/v1/simplify", content=_json.dumps(bad),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422
+
     print(
         "✓ API 端到端测试通过：提交 / 查询 / 列表 / 404 / 参数校验 / guarded 策略 / "
-        "趋势扫描 / 时滞关联 / 事件聚合 / 无状态重采样 / 计数器速率"
+        "趋势扫描 / 时滞关联 / 事件聚合 / 无状态重采样 / 计数器速率 / 折线压缩"
     )
 
 
@@ -2252,6 +2468,10 @@ if __name__ == "__main__":
     test_counter_rates_wrap_tolerance_boundaries()
     test_counter_rates_no_max_counter_and_zero_delta()
     test_counter_rates_gap_boundary_and_all_unknown()
+    test_simplify_swinging_door()
+    test_simplify_zero_error_collinear()
+    test_simplify_gap_break_keeps_both_sides()
+    test_simplify_replay_error_within_tolerance()
     test_api_end_to_end()
     test_counter_series_archive_api()
     test_segment_status_workflow()
